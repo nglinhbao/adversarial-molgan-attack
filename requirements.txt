@@ -1,0 +1,11 @@
+torch
+torch-geometric
+rdkit-pypi
+numpy<2.0.0
+scipy
+tqdm
+matplotlib
+scikit-learn
+pandas
+networkx
+rdkit
