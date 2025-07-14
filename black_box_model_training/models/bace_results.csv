@@ -1,0 +1,9 @@
+Model,Metric,Score,Direction,Saved File
+GRIN,ROC_AUC,0.8846,↑,bace_GRINMolecularPredictor.pt
+BFGNN,ROC_AUC,0.5610,↑,bace_BFGNNMolecularPredictor.pt
+GREA,ROC_AUC,0.8498,↑,bace_GREAMolecularPredictor.pt
+IRM,ROC_AUC,0.9123,↑,bace_IRMMolecularPredictor.pt
+RPGNN,ROC_AUC,0.8053,↑,bace_RPGNNMolecularPredictor.pt
+GNNs,ROC_AUC,0.9116,↑,bace_GNNMolecularPredictor.pt
+Transformer,ROC_AUC,0.4608,↑,bace_SMILESTransformerMolecularPredictor.pt
+LSTM,ROC_AUC,0.7998,↑,bace_LSTMMolecularPredictor.pt

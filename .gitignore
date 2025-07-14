@@ -42,14 +42,8 @@ venv.bak/
 *.swp
 *.swo
 
-# Results and data
-results/
+# data
 data/
-models/
-*.csv
-*.png
-*.jpg
-*.jpeg
 
 # OS
 .DS_Store

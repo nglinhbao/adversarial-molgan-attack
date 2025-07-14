@@ -1,0 +1,9 @@
+Model,Metric,Score,Direction,Saved File
+GRIN,MAE,0.6860,↓,qm7_GRINMolecularPredictor.pt
+BFGNN,MAE,0.7508,↓,qm7_BFGNNMolecularPredictor.pt
+GREA,MAE,1.3799,↓,qm7_GREAMolecularPredictor.pt
+IRM,MAE,0.7544,↓,qm7_IRMMolecularPredictor.pt
+RPGNN,MAE,0.7584,↓,qm7_RPGNNMolecularPredictor.pt
+GNNs,MAE,0.9106,↓,qm7_GNNMolecularPredictor.pt
+Transformer,MAE,0.8011,↓,qm7_SMILESTransformerMolecularPredictor.pt
+LSTM,MAE,0.8596,↓,qm7_LSTMMolecularPredictor.pt

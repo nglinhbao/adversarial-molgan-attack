@@ -1,0 +1,64 @@
+================================================================================
+ADVERSARIAL MOLECULAR ATTACK EVALUATION REPORT
+================================================================================
+
+Dataset: delaney
+Target Model: BFGNN
+Report Generated: 2025-07-01 20:23:13.711873
+
+ATTACK SUCCESS METRICS
+----------------------------------------
+Success Rate: 0.000
+Successful Attacks: 0
+Total Attempts: 1
+Average Prediction Change: 0.109
+Valid Pairs Generated: 1
+
+SIMILARITY METRICS
+----------------------------------------
+Average Tanimoto Similarity: 0.409
+Min Tanimoto Similarity: 0.409
+Max Tanimoto Similarity: 0.409
+
+MOLECULAR QUALITY METRICS
+----------------------------------------
+Validity: 1.000
+Valid Molecules: 1
+Total Molecules: 1
+Uniqueness: 1.000
+Unique Molecules: 1
+Novelty: 1.000
+Novel Molecules: 1
+
+TRANSFERABILITY RESULTS
+----------------------------------------
+GNN:
+  Success Rate: 0.000
+  Avg Prediction Change: 0.198
+  Successful Attacks: 0
+GREA:
+  Success Rate: 0.000
+  Avg Prediction Change: 0.000
+  Successful Attacks: 0
+GRIN:
+  Success Rate: 0.000
+  Avg Prediction Change: 0.228
+  Successful Attacks: 0
+IRM:
+  Success Rate: 0.000
+  Avg Prediction Change: 0.237
+  Successful Attacks: 0
+LSTM:
+  Success Rate: 0.000
+  Avg Prediction Change: 0.204
+  Successful Attacks: 0
+RPGNN:
+  Success Rate: 0.000
+  Avg Prediction Change: 0.021
+  Successful Attacks: 0
+SMILESTransformer:
+  Success Rate: 1.000
+  Avg Prediction Change: 0.775
+  Successful Attacks: 1
+
+================================================================================

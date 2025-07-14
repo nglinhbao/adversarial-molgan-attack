@@ -1,0 +1,25 @@
+Adversarial Generator Model Summary
+==================================
+
+Model saved at: results/delaney_BFGNN_2025-07-01_20-22-50/generator_model.pth
+Latent size: 56
+Actual input size: 56
+Hidden size: 256
+Number of layers: 3
+Perturbation scale: 10.0
+Adaptive scaling: True
+Use random noise: False
+
+Model architecture:
+AdversarialGenerator(
+  (network): Sequential(
+    (0): Linear(in_features=56, out_features=256, bias=True)
+    (1): ReLU()
+    (2): Dropout(p=0.1, inplace=False)
+    (3): Linear(in_features=256, out_features=256, bias=True)
+    (4): ReLU()
+    (5): Dropout(p=0.1, inplace=False)
+    (6): Linear(in_features=256, out_features=56, bias=True)
+    (7): Tanh()
+  )
+)

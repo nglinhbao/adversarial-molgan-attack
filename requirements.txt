@@ -9,3 +9,5 @@ scikit-learn
 pandas
 networkx
 rdkit
+torch-molecule
+torch-scatter

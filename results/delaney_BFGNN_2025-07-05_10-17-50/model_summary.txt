@@ -1,0 +1,35 @@
+Adversarial Generator Model Summary
+==================================
+
+Model saved at: results/delaney_BFGNN_2025-07-05_10-17-50/generator_model.pth
+Latent size: 56
+Actual input size: 56
+Hidden size: 256
+Number of layers: 3
+Perturbation scale: 5.0
+Adaptive scaling: False
+Use random noise: False
+
+Model architecture:
+AdversarialGenerator(
+  (network): Sequential(
+    (0): Linear(in_features=56, out_features=512, bias=True)
+    (1): BatchNorm1d(512, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+    (2): ReLU()
+    (3): Dropout(p=0.1, inplace=False)
+    (4): Linear(in_features=512, out_features=512, bias=True)
+    (5): BatchNorm1d(512, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+    (6): ReLU()
+    (7): Dropout(p=0.1, inplace=False)
+    (8): Linear(in_features=512, out_features=512, bias=True)
+    (9): BatchNorm1d(512, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+    (10): ReLU()
+    (11): Dropout(p=0.1, inplace=False)
+    (12): Linear(in_features=512, out_features=512, bias=True)
+    (13): BatchNorm1d(512, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+    (14): ReLU()
+    (15): Dropout(p=0.1, inplace=False)
+    (16): Linear(in_features=512, out_features=56, bias=True)
+    (17): Tanh()
+  )
+)

@@ -24,6 +24,9 @@ class TrainingPlotter:
         self.fig, self.axes = plt.subplots(2, 3, figsize=(15, 8))
         self.fig.suptitle('Adversarial Molecular Generator Training Progress', fontsize=16)
         
+        # Hide the bottom right subplot (axes[1, 2])
+        self.axes[1, 2].set_visible(False)
+        
         # Individual subplot titles
         self.axes[0, 0].set_title('Total Loss')
         self.axes[0, 1].set_title('Adversarial Loss')
@@ -31,10 +34,12 @@ class TrainingPlotter:
         self.axes[1, 0].set_title('Validity Rate')
         self.axes[1, 1].set_title('Molecular Change Rate')
         
-        # Set up axis labels
-        for ax in self.axes.flat:
-            ax.set_xlabel('Epoch')
-            ax.grid(True, alpha=0.3)
+        # Set up axis labels for visible plots only
+        for i in range(2):
+            for j in range(3):
+                if not (i == 1 and j == 2):  # Skip the hidden plot
+                    self.axes[i, j].set_xlabel('Epoch')
+                    self.axes[i, j].grid(True, alpha=0.3)
         
         # Y-axis labels
         self.axes[0, 0].set_ylabel('Loss')
@@ -42,7 +47,6 @@ class TrainingPlotter:
         self.axes[0, 2].set_ylabel('Loss')
         self.axes[1, 0].set_ylabel('Validity Rate (%)')
         self.axes[1, 1].set_ylabel('Change Rate (%)')
-        self.axes[1, 2].set_ylabel('Loss')
         
         plt.tight_layout()
         plt.show()
@@ -65,10 +69,12 @@ class TrainingPlotter:
         if len(self.epochs) == 0:
             return
         
-        # Clear all axes
-        for ax in self.axes.flat:
-            ax.clear()
-            ax.grid(True, alpha=0.3)
+        # Clear visible axes only
+        for i in range(2):
+            for j in range(3):
+                if not (i == 1 and j == 2):  # Skip the hidden plot
+                    self.axes[i, j].clear()
+                    self.axes[i, j].grid(True, alpha=0.3)
         
         # Plot 1: Total Loss
         self.axes[0, 0].plot(self.epochs, self.total_losses, 'b-', linewidth=2, label='Total Loss')
@@ -142,6 +148,9 @@ class TrainingPlotter:
             final_fig, final_axes = plt.subplots(2, 3, figsize=(15, 8))
             final_fig.suptitle('Adversarial Molecular Generator Training Progress - Final Results', fontsize=16)
             
+            # Hide the bottom right subplot in final figure too
+            final_axes[1, 2].set_visible(False)
+            
             if len(self.epochs) == 0:
                 return
             
@@ -204,16 +213,16 @@ class TrainingPlotter:
             final_fig.savefig(self.save_path, dpi=300, bbox_inches='tight', 
                             facecolor='white', edgecolor='none')
             
-            # Also save a timestamped version
-            import datetime
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            timestamped_path = self.save_path.replace('.png', f'_{timestamp}.png')
-            final_fig.savefig(timestamped_path, dpi=300, bbox_inches='tight', 
-                            facecolor='white', edgecolor='none')
+            # # Also save a timestamped version
+            # import datetime
+            # timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            # timestamped_path = self.save_path.replace('.png', f'_{timestamp}.png')
+            # final_fig.savefig(timestamped_path, dpi=300, bbox_inches='tight', 
+            #                 facecolor='white', edgecolor='none')
             
             print(f"Training progress plots saved to:")
             print(f"  - {self.save_path}")
-            print(f"  - {timestamped_path}")
+            # print(f"  - {timestamped_path}")
             
             plt.close(final_fig)
             plt.ion()  # Turn interactive mode back on

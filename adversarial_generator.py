@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.profiler
 import numpy as np
 from tqdm import tqdm
 from rdkit import Chem
@@ -9,11 +10,12 @@ from training_plotter import TrainingPlotter
 from matplotlib import pyplot as plt
 from datetime import datetime
 import os
+import csv
 
 class AdversarialGenerator(nn.Module):
     """Generator network for adversarial perturbations in latent space"""
     
-    def __init__(self, latent_size, hidden_size=256, num_layers=3, actual_input_size=None):
+    def __init__(self, latent_size, hidden_size=512, num_layers=5, actual_input_size=None):
         super(AdversarialGenerator, self).__init__()
         
         # Use actual input size if provided, otherwise use latent_size
@@ -30,10 +32,11 @@ class AdversarialGenerator(nn.Module):
         layers = []
         current_size = latent_size
         
-        # Create the network architecture
+        # Create the network architecture with more layers for GPU utilization
         for i in range(num_layers - 1):
             layers.extend([
                 nn.Linear(current_size, hidden_size),
+                nn.BatchNorm1d(hidden_size),  # Add batch norm for better GPU utilization
                 nn.ReLU(),
                 nn.Dropout(0.1)
             ])
@@ -45,10 +48,10 @@ class AdversarialGenerator(nn.Module):
         
         self.network = nn.Sequential(*layers)
         
-        # Scale factor for perturbations (can be adjusted)
-        self.perturbation_scale = 10.0  # Further increased to ensure molecular diversity
+        # Scale factor for perturbations (start smaller for stability)
+        self.perturbation_scale = 5.0  # Increased from 1.0 for better molecular diversity
         self.use_random_noise = False  # Option to use random noise instead of learned perturbations
-        self.adaptive_scaling = True  # Disable adaptive scaling since 5.0x works well
+        self.adaptive_scaling = False  # Disable adaptive scaling since 5.0x works well
         self.max_perturbation_attempts = 3  # Maximum attempts to find effective perturbations
         
     def forward(self, z):
@@ -126,7 +129,7 @@ class AdversarialGenerator(nn.Module):
 class AdversarialMolCycleGAN:
     """Main class for adversarial molecular generation with validity discriminator"""
     
-    def __init__(self, jtvae_wrapper, black_box_model, results_name=None):
+    def __init__(self, jtvae_wrapper, black_box_model, learning_rate, results_name=None):
         self.jtvae = jtvae_wrapper
         self.black_box_model = black_box_model
         
@@ -153,8 +156,33 @@ class AdversarialMolCycleGAN:
         # Print model architecture for debugging
         print(f"Generator architecture:\n{self.generator}")
 
-        # Optimizer for the generator
-        self.generator_optimizer = optim.Adam(self.generator.parameters(), lr=0.001)
+        # Optimizer for the generator with improved settings
+        self.generator_optimizer = optim.Adam(
+            self.generator.parameters(), 
+            lr=learning_rate,
+            betas=(0.5, 0.999),  # More stable for adversarial training
+            weight_decay=1e-5    # Small regularization
+        )
+        
+        # Learning rate scheduler for stability
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.generator_optimizer, 
+            mode='min', 
+            factor=0.5, 
+            patience=5, 
+            # verbose=True,
+            min_lr=1e-6
+        )
+        
+        # Exponential moving averages for loss tracking
+        self.ema_alpha = 0.1
+        self.adv_loss_ema = None
+        self.sim_loss_ema = None
+        
+        # Early stopping parameters
+        self.best_loss = float('inf')
+        self.patience_counter = 0
+        self.early_stopping_patience = 15  # Stop if no improvement for 15 epochs
 
         # Create results directory with provided name or default timestamp
         if results_name is None:
@@ -167,61 +195,98 @@ class AdversarialMolCycleGAN:
 
         # Initialize plotter
         self.plotter = TrainingPlotter(os.path.join(self.results_path, 'training_progress.png'))
+        
+        # Initialize CSV logging
+        self.csv_file_path = os.path.join(self.results_path, 'training_results.csv')
+        self.csv_fieldnames = [
+            'epoch', 
+            'total_loss', 
+            'adversarial_loss', 
+            'similarity_loss', 
+            'validity_rate', 
+            'molecular_change_rate',
+            'learning_rate',
+            'timestamp'
+        ]
+        self._initialize_csv()
     
-    def check_molecule_validity(
-        self,
-        smiles_list: List[Optional[str]]
-    ) -> torch.FloatTensor:
-        """
-        Check which molecules are valid and return a tensor of validity labels (1.0 = valid, 0.0 = invalid).
-
-        Args:
-            smiles_list (List[Optional[str]]): List of SMILES strings (or None).
-
-        Returns:
-            torch.FloatTensor: 1D tensor of shape (len(smiles_list),) with 1.0 for valid molecules, 0.0 for invalid.
-        """
-        validity_labels: List[float] = []
-        valid_count = 0
-        total_count = 0
-
-        for smiles in smiles_list:
-            total_count += 1
-
-            # Immediately invalid if missing
-            if smiles is None:
-                validity_labels.append(0.0)
-                continue
-
-            # RDKit parsing without automatic sanitization
-            mol = Chem.MolFromSmiles(smiles, sanitize=False)
-            if mol is None:
-                validity_labels.append(0.0)
-                continue
-
-            try:
-                # Full sanitization (valence, aromaticity, etc.)
-                Chem.SanitizeMol(mol)
-
-                # Round-trip SMILES to ensure consistency
-                canon = Chem.MolToSmiles(mol, isomericSmiles=True)
-
-                # Molecule is valid if it round-trips and has at least one atom
-                if canon and mol.GetNumAtoms() > 0:
-                    validity_labels.append(1.0)
-                    valid_count += 1
-                else:
-                    validity_labels.append(0.0)
-            except Exception:
-                validity_labels.append(0.0)
-
-        return torch.FloatTensor(validity_labels).to(self.device)
+    def _initialize_csv(self):
+        """Initialize CSV file with headers"""
+        try:
+            with open(self.csv_file_path, 'w', newline='') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=self.csv_fieldnames)
+                writer.writeheader()
+            print(f"Initialized CSV log file: {self.csv_file_path}")
+        except Exception as e:
+            print(f"Warning: Could not initialize CSV file: {e}")
+    
+    def _log_to_csv(self, epoch, loss_dict, change_rate, learning_rate):
+        """Log training results to CSV file"""
+        try:
+            # Prepare row data
+            row_data = {
+                'epoch': epoch,
+                'total_loss': loss_dict.get('total_loss', 0.0),
+                'adversarial_loss': loss_dict.get('adversarial_loss', 0.0),
+                'similarity_loss': loss_dict.get('similarity_loss', 0.0),
+                'validity_rate': loss_dict.get('validity_rate', 0.0),
+                'molecular_change_rate': change_rate,
+                'learning_rate': learning_rate,
+                'timestamp': datetime.now().isoformat()
+            }
+            
+            # Append to CSV file
+            with open(self.csv_file_path, 'a', newline='') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=self.csv_fieldnames)
+                writer.writerow(row_data)
+                
+        except Exception as e:
+            print(f"Warning: Could not log to CSV file: {e}")
+    
+    def get_training_statistics(self):
+        """Load and return training statistics from CSV file"""
+        try:
+            if os.path.exists(self.csv_file_path):
+                df = pd.read_csv(self.csv_file_path)
+                return df
+            else:
+                print("No training results CSV file found.")
+                return None
+        except Exception as e:
+            print(f"Error loading training statistics: {e}")
+            return None
+    
+    def save_training_summary(self):
+        """Save a summary of training results"""
+        try:
+            df = self.get_training_statistics()
+            if df is not None and len(df) > 0:
+                summary_path = os.path.join(self.results_path, 'training_summary.txt')
+                
+                with open(summary_path, 'w') as f:
+                    f.write("Training Results Summary\n")
+                    f.write("========================\n\n")
+                    f.write(f"Total epochs: {len(df)}\n")
+                    f.write(f"Final total loss: {df['total_loss'].iloc[-1]:.6f}\n")
+                    f.write(f"Best total loss: {df['total_loss'].min():.6f}\n")
+                    f.write(f"Final adversarial loss: {df['adversarial_loss'].iloc[-1]:.6f}\n")
+                    f.write(f"Final similarity loss: {df['similarity_loss'].iloc[-1]:.6f}\n")
+                    f.write(f"Final validity rate: {df['validity_rate'].iloc[-1]:.2%}\n")
+                    f.write(f"Final molecular change rate: {df['molecular_change_rate'].iloc[-1]:.1f}%\n")
+                    f.write(f"Average validity rate: {df['validity_rate'].mean():.2%}\n")
+                    f.write(f"Average molecular change rate: {df['molecular_change_rate'].mean():.1f}%\n")
+                    f.write(f"Final learning rate: {df['learning_rate'].iloc[-1]:.2e}\n")
+                    
+                print(f"Training summary saved to: {summary_path}")
+                
+        except Exception as e:
+            print(f"Error saving training summary: {e}")
     
     # Convert numpy arrays to torch tensors for adversarial loss
 
     def adversarial_loss(self, original_pred, adversarial_pred, target_pred=None, success_threshold=0.2):
         """
-        Compute adversarial loss - now designed to be minimized
+        Compute adversarial loss with improved stability
         
         Args:
             success_threshold: For regression, the minimum relative change needed to consider attack successful (default: 20%)
@@ -230,11 +295,12 @@ class AdversarialMolCycleGAN:
         adversarial_pred = torch.tensor(adversarial_pred, device=self.device)
 
         if self.black_box_model.model_type == 'classification':
-            # For classification: minimize negative prediction difference (maximize difference)
+            # For classification: use smooth loss that encourages change but avoids instability
             prediction_diff = torch.abs(original_pred - adversarial_pred).mean()
-            return 1.0 / (prediction_diff + 1e-8)  # Convert to minimization problem
+            # Use negative log to encourage larger differences, but with stability
+            return -torch.log(prediction_diff + 1e-6)
         else:
-            # For regression: threshold-based success criterion
+            # For regression: improved threshold-based success criterion
             if target_pred is not None:
                 target_pred = torch.tensor(target_pred, device=self.device)
                 return torch.abs(adversarial_pred - target_pred).mean()
@@ -243,19 +309,17 @@ class AdversarialMolCycleGAN:
                 prediction_diff = torch.abs(original_pred - adversarial_pred)
                 relative_change = prediction_diff / (torch.abs(original_pred) + 1e-8)
                 
-                # If relative change exceeds threshold, attack is successful (low loss)
-                # If below threshold, penalize proportionally to encourage reaching threshold
-                success_mask = relative_change >= success_threshold
+                # Smooth transition around success threshold using sigmoid
+                # This avoids sharp discontinuities that cause instability
+                sigmoid_factor = 10.0  # Controls smoothness of transition
+                success_probability = torch.sigmoid(sigmoid_factor * (relative_change - success_threshold))
                 
-                # For successful attacks: small constant loss (attack achieved)
-                success_loss = torch.ones_like(relative_change) * 0.1
+                # Combine smooth success and failure components
+                success_loss = 0.1  # Low loss when successful
+                failure_loss = torch.clamp(success_threshold - relative_change, min=0.0) / success_threshold
                 
-                # For unsuccessful attacks: inversely proportional to progress toward threshold
-                # This encourages reaching the threshold but doesn't push beyond unnecessarily
-                failure_loss = (success_threshold - relative_change) / success_threshold
-                
-                # Combine losses based on success mask
-                total_loss = torch.where(success_mask, success_loss, failure_loss)
+                # Smoothly interpolate between success and failure loss
+                total_loss = success_probability * success_loss + (1 - success_probability) * failure_loss
                 
                 return total_loss.mean()
 
@@ -265,23 +329,20 @@ class AdversarialMolCycleGAN:
         return torch.norm(original_z - adversarial_z, p=1, dim=1).mean()
     
     def train_step(self, smiles_list, lambda_adv, lambda_sim, epoch, success_threshold):
-        """Single training step adapted for mol-cycle-gan style encoding"""
+        """Single training step adapted for mol-cycle-gan style encoding with GPU optimization"""
         # Encode original molecules using mol-cycle-gan style
         latent_array = self.jtvae.encode_to_numpy(smiles_list)
 
         if latent_array.size == 0:
             return None
 
-        # Convert to tensor
+        # Convert to tensor and keep on GPU for all operations
         original_z = torch.FloatTensor(latent_array).to(self.device)
 
-        # Generate adversarial latent vectors with adaptive scaling
-        if hasattr(self.generator, 'adaptive_scaling') and self.generator.adaptive_scaling:
-            adversarial_z = self.generator.generate_adaptive_perturbation(original_z, self.jtvae)
-        else:
-            adversarial_z = self.generator(original_z)
+        # Generate adversarial latent vectors - always use forward for better GPU utilization
+        adversarial_z = self.generator(original_z)
 
-        # Decode latent vectors to SMILES
+        # Batch decode on CPU to minimize transfers
         original_smiles = self.jtvae.decode_from_numpy(original_z.detach().cpu().numpy())
         adversarial_smiles = self.jtvae.decode_from_numpy(adversarial_z.detach().cpu().numpy())
 
@@ -313,16 +374,36 @@ class AdversarialMolCycleGAN:
         adversarial_preds = self.black_box_model.predict(valid_adversarial_smiles)
         adv_loss = self.adversarial_loss(original_preds, adversarial_preds, success_threshold)
 
-        # Compute similarity loss
-        sim_loss = self.similarity_loss(original_z, adversarial_z)
+        # Compute similarity loss with L2 norm for smoother gradients
+        sim_loss = torch.norm(original_z - adversarial_z, p=2, dim=1).mean()
 
-        # Total loss - both components are now positive and minimized
-        # This prevents cancellation and ensures both objectives are optimized
-        total_loss = lambda_adv * adv_loss + lambda_sim * sim_loss
+        # Update exponential moving averages
+        if self.adv_loss_ema is None:
+            self.adv_loss_ema = adv_loss.item()
+            self.sim_loss_ema = sim_loss.item()
+        else:
+            self.adv_loss_ema = self.ema_alpha * adv_loss.item() + (1 - self.ema_alpha) * self.adv_loss_ema
+            self.sim_loss_ema = self.ema_alpha * sim_loss.item() + (1 - self.ema_alpha) * self.sim_loss_ema
 
-        # Backpropagation
+        # Adaptive loss balancing using EMA to prevent one loss from dominating
+        adv_scale = 1.0 / (self.adv_loss_ema + 1e-8)
+        sim_scale = 1.0 / (self.sim_loss_ema + 1e-8)
+        
+        # Normalize scales
+        total_scale = adv_scale + sim_scale
+        adv_weight = adv_scale / total_scale
+        sim_weight = sim_scale / total_scale
+        
+        # Total loss with adaptive weighting and original lambdas
+        total_loss = lambda_adv * adv_weight * adv_loss + lambda_sim * sim_weight * sim_loss
+
+        # Backpropagation with gradient clipping for stability
         self.generator_optimizer.zero_grad()
         total_loss.backward()
+        
+        # Gradient clipping to prevent exploding gradients
+        torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=1.0)
+        
         self.generator_optimizer.step()
 
         # Calculate validity rate and molecular change rate
@@ -371,9 +452,27 @@ class AdversarialMolCycleGAN:
             
             return adversarial_molecules
     
-    def train(self, training_smiles, epochs, batch_size, lambda_adv, lambda_sim, success_threshold, plot_progress=True):
-        """Train the adversarial generator with validity discriminator and optional live plotting"""
+    def train(self, training_smiles, epochs, batch_size, lambda_adv, lambda_sim, success_threshold, plot_progress=True, save_checkpoints=True, checkpoint_interval=50):
+        """Train the adversarial generator with validity discriminator and optional live plotting
+        
+        Args:
+            training_smiles: List of SMILES strings for training
+            epochs: Number of training epochs
+            batch_size: Batch size for training
+            lambda_adv: Weight for adversarial loss
+            lambda_sim: Weight for similarity loss
+            success_threshold: Threshold for adversarial success
+            plot_progress: Whether to show live plots during training
+            save_checkpoints: Whether to save model checkpoints during training
+            checkpoint_interval: Save checkpoint every N epochs
+        """
+        
         self.generator.train()
+        
+        # Print training info
+        print(f"\n=== Training Configuration ===")
+        print(f"Batch size: {batch_size}")
+        print(f"Total batches per epoch: {len(training_smiles) // batch_size}")
                 
         for epoch in tqdm(range(epochs), desc="Training"):
             epoch_losses = []
@@ -410,17 +509,49 @@ class AdversarialMolCycleGAN:
                         f"Adv Loss: {avg_adv_loss:.4f}, Sim Loss: {avg_sim_loss:.4f}, "
                         f"Validity Rate: {avg_validity_rate:.2%}, "
                         f"Change Rate: {avg_change_rate:.1f}%")
+                
+                # Update learning rate scheduler
+                self.scheduler.step(avg_total_loss)
+
+                # Log to CSV
+                current_lr = self.generator_optimizer.param_groups[0]['lr']
+                avg_loss_dict = {
+                    'total_loss': avg_total_loss,
+                    'adversarial_loss': avg_adv_loss,
+                    'similarity_loss': avg_sim_loss,
+                    'validity_rate': avg_validity_rate
+                }
+                self._log_to_csv(epoch, avg_loss_dict, avg_change_rate, current_lr)
+                
+                # Early stopping check
+                if avg_total_loss < self.best_loss:
+                    self.best_loss = avg_total_loss
+                    self.patience_counter = 0
+                    # Save best model
+                    if save_checkpoints:
+                        best_model_path = f"best_generator_epoch_{epoch}.pth"
+                        self.save_generator_model(best_model_path)
+                        print(f"New best model saved at epoch {epoch}")
+                else:
+                    self.patience_counter += 1
+                    
+                if self.patience_counter >= self.early_stopping_patience:
+                    print(f"Early stopping triggered at epoch {epoch} - no improvement for {self.early_stopping_patience} epochs")
+                    break
 
                 # Update live plot with epoch-averaged data
                 if self.plotter is not None:
-                    avg_loss_dict = {
-                        'total_loss': avg_total_loss,
-                        'adversarial_loss': avg_adv_loss,
-                        'similarity_loss': avg_sim_loss,
-                        'validity_rate': avg_validity_rate
-                    }
                     self.plotter.update_data(epoch, avg_loss_dict, avg_change_rate)
                     self.plotter.update_plots()
+                
+                # Save checkpoint at specified intervals
+                if save_checkpoints and (epoch + 1) % checkpoint_interval == 0:
+                    checkpoint_filename = f"generator_checkpoint_epoch_{epoch + 1}.pth"
+                    self.save_generator_model(checkpoint_filename)
+                    print(f"Checkpoint saved at epoch {epoch + 1}")
+        
+        # Save final training summary
+        self.save_training_summary()
         
         # Save final plot and keep it open
         if self.plotter is not None:
@@ -430,3 +561,83 @@ class AdversarialMolCycleGAN:
                 plt.show(block=True)
             except KeyboardInterrupt:
                 pass
+        
+        # Save the trained generator model
+        self.save_generator_model()
+
+    def save_generator_model(self, filename=None):
+        """Save the trained generator model to disk"""
+        if filename is None:
+            filename = f"generator_model.pth"
+        
+        model_path = os.path.join(self.results_path, filename)
+        
+        # Save model state dict along with configuration
+        save_dict = {
+            'model_state_dict': self.generator.state_dict(),
+            'model_config': {
+                'latent_size': self.latent_size,
+                'hidden_size': 256,  # Default from __init__
+                'num_layers': 3,     # Default from __init__
+                'actual_input_size': getattr(self.generator, 'input_size', self.latent_size),
+                'perturbation_scale': self.generator.perturbation_scale,
+                'adaptive_scaling': getattr(self.generator, 'adaptive_scaling', True),
+                'use_random_noise': getattr(self.generator, 'use_random_noise', False)
+            },
+            'optimizer_state_dict': self.generator_optimizer.state_dict()
+        }
+        
+        torch.save(save_dict, model_path)
+        print(f"Generator model saved to: {model_path}")
+        
+        # Also save a human-readable summary
+        summary_path = os.path.join(self.results_path, "model_summary.txt")
+        with open(summary_path, 'w') as f:
+            f.write("Adversarial Generator Model Summary\n")
+            f.write("==================================\n\n")
+            f.write(f"Model saved at: {model_path}\n")
+            f.write(f"Latent size: {self.latent_size}\n")
+            f.write(f"Actual input size: {save_dict['model_config']['actual_input_size']}\n")
+            f.write(f"Hidden size: {save_dict['model_config']['hidden_size']}\n")
+            f.write(f"Number of layers: {save_dict['model_config']['num_layers']}\n")
+            f.write(f"Perturbation scale: {save_dict['model_config']['perturbation_scale']}\n")
+            f.write(f"Adaptive scaling: {save_dict['model_config']['adaptive_scaling']}\n")
+            f.write(f"Use random noise: {save_dict['model_config']['use_random_noise']}\n")
+            f.write(f"\nModel architecture:\n{self.generator}\n")
+        
+        print(f"Model summary saved to: {summary_path}")
+        return model_path
+
+    def load_generator_model(self, model_path):
+        """Load a previously saved generator model"""
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Model file not found: {model_path}")
+        
+        save_dict = torch.load(model_path, map_location=self.device)
+        
+        # Load model configuration
+        model_config = save_dict.get('model_config', {})
+        
+        # Recreate generator with saved configuration
+        self.generator = AdversarialGenerator(
+            latent_size=model_config.get('latent_size', self.latent_size),
+            hidden_size=model_config.get('hidden_size', 256),
+            num_layers=model_config.get('num_layers', 3),
+            actual_input_size=model_config.get('actual_input_size', None)
+        )
+        
+        # Set additional attributes
+        self.generator.perturbation_scale = model_config.get('perturbation_scale', 10.0)
+        self.generator.adaptive_scaling = model_config.get('adaptive_scaling', True)
+        self.generator.use_random_noise = model_config.get('use_random_noise', False)
+        
+        # Load model weights
+        self.generator.load_state_dict(save_dict['model_state_dict'])
+        self.generator.to(self.device)
+        
+        # Load optimizer state if available
+        if 'optimizer_state_dict' in save_dict:
+            self.generator_optimizer.load_state_dict(save_dict['optimizer_state_dict'])
+        
+        print(f"Generator model loaded from: {model_path}")
+        return self.generator

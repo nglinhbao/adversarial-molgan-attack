@@ -1,0 +1,9 @@
+Model,Metric,Score,Direction,Saved File
+GRIN,MAE,0.5105,↓,delaney_GRINMolecularPredictor.pt
+BFGNN,MAE,0.2841,↓,delaney_BFGNNMolecularPredictor.pt
+GREA,MAE,0.2817,↓,delaney_GREAMolecularPredictor.pt
+IRM,MAE,0.6259,↓,delaney_IRMMolecularPredictor.pt
+RPGNN,MAE,0.2734,↓,delaney_RPGNNMolecularPredictor.pt
+GNNs,MAE,0.3659,↓,delaney_GNNMolecularPredictor.pt
+Transformer,MAE,0.4487,↓,delaney_SMILESTransformerMolecularPredictor.pt
+LSTM,MAE,0.2425,↓,delaney_LSTMMolecularPredictor.pt

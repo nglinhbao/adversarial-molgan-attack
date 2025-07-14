@@ -1,133 +1,200 @@
 import os
+import argparse
 import numpy as np
 import pandas as pd
+import pickle
 from rdkit import Chem
 import deepchem as dc
 from jtvae_wrapper import JTVAEWrapper
 from black_box_model import BlackBoxModel
 from adversarial_generator import AdversarialMolCycleGAN
-from evaluation import evaluate_adversarial_attack, plot_evaluation_results
+from evaluation import comprehensive_evaluation, evaluate_molecular_quality
 from datetime import datetime
+from data_loader import DATASETS, load_molecules_from_dataset, get_property_name, list_filtered_datasets, clean_filtered_datasets
 
-def _to_xy(ds):
-    """Return (list_of_smiles, numpy_targets) for a DeepChem Dataset."""
-    smiles = [s.replace(" ", "") for s in ds.ids]  # Remove spaces from SMILES
-    y = ds.y
-    # Ensure 2‑D targets (n_samples, n_tasks)
-    if y.ndim == 1:
-        y = y.reshape(-1, 1)
-    return smiles, y
-
-def load_delaney(root="data/delaney"):
-    """Load Delaney (regression dataset) via DeepChem."""
-    tasks, (tr, va, te), _ = dc.molnet.load_delaney(
-        featurizer="Raw",        # keeps original SMILES in ds.ids
-        splitter="random",       # 80/10/10 split below
-        frac_train=0.8,
-        frac_valid=0.1,
-        frac_test=0.1,
-        data_dir=root,
-        reload=False,
-    )
-    # Delaney has 1 regression task by default – keep it.
-    return tasks, *map(_to_xy, (tr, va, te))
-
-def load_molecules_from_delaney(subset, max_molecules=None, jtvae_wrapper=None):
-    """Load molecules from Delaney dataset for adversarial training"""
-    print(f"Loading Delaney dataset...")
-    tasks, train, valid, test = load_delaney()
+def get_available_models_dict(dataset_name):
+    """Get dictionary of all available trained models for transferability testing"""
+    models_dir = "black_box_model_training/models"
+    models_dict = {}
     
-    print(f"Delaney dataset loaded:")
-    print(f"  Tasks: {tasks}")
-    print(f"  Train: {len(train[0])} molecules")
-    print(f"  Valid: {len(valid[0])} molecules") 
-    print(f"  Test: {len(test[0])} molecules")
+    if not os.path.exists(models_dir):
+        print("Models directory not found!")
+        return models_dict
     
-    # Select subset
-    if subset == 'train':
-        smiles_list, targets = train
-    elif subset == 'valid':
-        smiles_list, targets = valid
-    elif subset == 'test':
-        smiles_list, targets = test
-    else:
-        # Combine all for more diversity
-        all_smiles = train[0] + valid[0] + test[0]
-        all_targets = np.vstack([train[1], valid[1], test[1]])
-        smiles_list, targets = all_smiles, all_targets
+    # Available model architectures
+    available_models = [
+        "BFGNN", "GNN", "GREA", "GRIN", "IRM", 
+        "LSTM", "RPGNN", "SMILESTransformer"
+    ]
     
-    # Limit number of molecules if specified (before filtering to have more candidates)
-    if max_molecules and len(smiles_list) > max_molecules * 3:  # Get 3x more for filtering
-        indices = np.random.choice(len(smiles_list), max_molecules * 3, replace=False)
-        smiles_list = [smiles_list[i] for i in indices]
-        targets = targets[indices]
-
-    print(f"Selected {len(smiles_list)} molecules from {subset} subset for filtering")
+    # Map architecture names to file names
+    model_filename_map = {
+        "BFGNN": "BFGNNMolecularPredictor",
+        "GNN": "GNNMolecularPredictor", 
+        "GREA": "GREAMolecularPredictor",
+        "GRIN": "GRINMolecularPredictor",
+        "IRM": "IRMMolecularPredictor",
+        "LSTM": "LSTMMolecularPredictor",
+        "RPGNN": "RPGNNMolecularPredictor",
+        "SMILESTransformer": "SMILESTransformerMolecularPredictor"
+    }
     
-    # Filter out invalid SMILES and molecules that JT-VAE cannot process
-    valid_smiles = []
-    valid_targets = []
-    jtvae_processable_count = 0
+    dataset_cfg = DATASETS[dataset_name]
     
-    for i, smiles in enumerate(smiles_list):
-        # First check RDKit validity
-        mol = Chem.MolFromSmiles(smiles)
-        if mol is None:
-            continue
+    print(f"Loading available models for transferability testing...")
+    for arch in available_models:
+        model_filename = model_filename_map[arch]
+        model_path = f"{models_dir}/{dataset_name}_{model_filename}.pt"
         
-        # If JT-VAE wrapper is provided, test encoding/decoding
-        if jtvae_wrapper is not None:
+        if os.path.exists(model_path):
             try:
-                # Test encoding
-                latent_array = jtvae_wrapper.encode_to_numpy([smiles])
-                if latent_array.size == 0:
-                    continue
-                
-                # Test decoding
-                decoded_smiles = jtvae_wrapper.decode_from_numpy(latent_array)
-                if not decoded_smiles or decoded_smiles[0] is None:
-                    continue
-                
-                # Molecule is JT-VAE processable
-                jtvae_processable_count += 1
-                valid_smiles.append(smiles)
-                valid_targets.append(targets[i])
-                
-                # Stop if we have enough molecules
-                if max_molecules and len(valid_smiles) >= max_molecules:
-                    break
-                    
+                # Create BlackBoxModel instance for this architecture
+                model = BlackBoxModel(
+                    model_path=model_path,
+                    model_type=dataset_cfg['task_type']
+                )
+                models_dict[arch] = model
+                print(f"  ✓ Loaded {arch} model")
             except Exception as e:
-                # Skip molecules that cause JT-VAE errors
-                continue
+                print(f"  ✗ Failed to load {arch} model: {e}")
         else:
-            # If no JT-VAE wrapper provided, just use RDKit filtering
-            valid_smiles.append(smiles)
-            valid_targets.append(targets[i])
+            print(f"  - {arch} model not available")
     
-    if jtvae_wrapper is not None:
-        print(f"JT-VAE filtering results:")
-        print(f"  RDKit valid molecules tested: {i+1}")
-        print(f"  JT-VAE processable molecules: {jtvae_processable_count}")
-        print(f"  Final dataset: {len(valid_smiles)} molecules")
-    else:
-        print(f"RDKit filtering results:")
-        print(f"  Final dataset: {len(valid_smiles)} valid molecules")
+    print(f"Loaded {len(models_dict)} models for transferability testing")
+    return models_dict
+
+def get_blackbox_model_path(dataset_name, model_architecture="BFGNN"):
+    """Get the appropriate black-box model path for the dataset and architecture"""
     
-    # Show some examples
-    print("Example molecules:")
-    for i, smiles in enumerate(valid_smiles[:5]):
-        target_value = valid_targets[i][0] if len(valid_targets[i]) > 0 else "N/A"
-        print(f"  {i+1}. {smiles} (solubility: {target_value:.3f})")
+    # Available model architectures
+    available_models = [
+        "BFGNN", "GNN", "GREA", "GRIN", "IRM", 
+        "LSTM", "RPGNN", "SMILESTransformer"
+    ]
     
-    return valid_smiles, np.array(valid_targets)
+    if model_architecture not in available_models:
+        print(f"Warning: Unknown model architecture '{model_architecture}'")
+        print(f"Available models: {available_models}")
+        model_architecture = "BFGNN"  # Default fallback
+    
+    # Map architecture names to file names
+    model_filename_map = {
+        "BFGNN": "BFGNNMolecularPredictor",
+        "GNN": "GNNMolecularPredictor", 
+        "GREA": "GREAMolecularPredictor",
+        "GRIN": "GRINMolecularPredictor",
+        "IRM": "IRMMolecularPredictor",
+        "LSTM": "LSTMMolecularPredictor",
+        "RPGNN": "RPGNNMolecularPredictor",
+        "SMILESTransformer": "SMILESTransformerMolecularPredictor"
+    }
+    
+    model_filename = model_filename_map[model_architecture]
+    model_path = f"black_box_model_training/models/{dataset_name}_{model_filename}.pt"
+    
+    return model_path
+
+def list_available_models(dataset_name=None):
+    """List all available trained models"""
+    models_dir = "black_box_model_training/models"
+    
+    if not os.path.exists(models_dir):
+        print("Models directory not found!")
+        return
+    
+    files = [f for f in os.listdir(models_dir) if f.endswith('.pt')]
+    
+    if dataset_name:
+        files = [f for f in files if f.startswith(dataset_name)]
+    
+    if not files:
+        print(f"No models found{f' for dataset {dataset_name}' if dataset_name else ''}!")
+        return
+    
+    print(f"Available models{f' for {dataset_name}' if dataset_name else ''}:")
+    
+    # Group by dataset
+    datasets = {}
+    for file in sorted(files):
+        parts = file.replace('.pt', '').split('_', 1)
+        if len(parts) == 2:
+            ds, model = parts
+            if ds not in datasets:
+                datasets[ds] = []
+            # Extract just the model name (remove "MolecularPredictor")
+            model_name = model.replace("MolecularPredictor", "")
+            datasets[ds].append(model_name)
+    
+    for ds, models in datasets.items():
+        print(f"  {ds.upper()}:")
+        for model in sorted(models):
+            model_path = f"{models_dir}/{ds}_{model}MolecularPredictor.pt"
+            if os.path.exists(model_path):
+                size = os.path.getsize(model_path) / (1024*1024)  # MB
+                print(f"    - {model} ({size:.1f} MB)")
 
 def main():
-    print("=== Adversarial Mol-CycleGAN Implementation ===")
-    print("Loading molecules from DeepChem Delaney dataset")
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description="Adversarial Mol-CycleGAN Attack on Molecular Property Prediction")
+    parser.add_argument("--dataset", choices=list(DATASETS.keys()), default="delaney",
+                       help="Dataset to use for adversarial attack")
+    parser.add_argument("--model_architecture", type=str, default="BFGNN",
+                       choices=["BFGNN", "GNN", "GREA", "GRIN", "IRM", "LSTM", "RPGNN", "SMILESTransformer"],
+                       help="Black-box model architecture to attack")
+    parser.add_argument("--max_train_molecules", type=int, default=None,
+                       help="Maximum number of training molecules to use")
+    parser.add_argument("--max_test_molecules", type=int, default=None,
+                       help="Maximum number of test molecules to use")
+    parser.add_argument("--epochs", type=int, default=20,
+                       help="Number of training epochs")
+    parser.add_argument("--batch_size", type=int, default=128,
+                       help="Training batch size (increased for better GPU utilization)")
+    parser.add_argument("--learning_rate", type=float, default=0.0001,
+                       help="Learning rate for the generator (reduced for stability)")
+    parser.add_argument("--lambda_adv", type=float, default=2.0,
+                       help="Adversarial loss weight (reduced for better balance)")
+    parser.add_argument("--lambda_sim", type=float, default=1.0,
+                       help="Similarity loss weight (increased for better balance)")
+    parser.add_argument("--success_threshold", type=float, default=0.7,
+                       help="Success threshold for adversarial examples")
+    parser.add_argument("--checkpoint_interval", type=int, default=5,
+                       help="Interval for saving checkpoints")
+    parser.add_argument("--force_refilter", action="store_true",
+                       help="Force re-filtering even if cached dataset exists")
+    parser.add_argument("--list_datasets", action="store_true",
+                       help="List available filtered datasets and exit")
+    parser.add_argument("--list_models", action="store_true",
+                       help="List available trained models and exit")
+    parser.add_argument("--clean_datasets", type=str, nargs="?", const="all",
+                       help="Clean filtered datasets (specify dataset name or 'all')")
+    
+    args = parser.parse_args()
+    
+    # Handle utility commands
+    if args.list_datasets:
+        list_filtered_datasets()
+        return
+    
+    if args.list_models:
+        list_available_models(args.dataset if args.dataset != "delaney" else None)
+        return
+    
+    if args.clean_datasets:
+        if args.clean_datasets == "all":
+            clean_filtered_datasets()
+        else:
+            clean_filtered_datasets(args.clean_datasets)
+        return
+    
+    print(f"=== Adversarial Mol-CycleGAN Implementation ===")
+    print(f"Dataset: {args.dataset.upper()}")
+    print(f"Model Architecture: {args.model_architecture}")
+    print(f"Task type: {DATASETS[args.dataset]['task_type']}")
+    print(f"Metric: {DATASETS[args.dataset]['metric_name']}")
+    print(f"Force refilter: {args.force_refilter}")
     
     # Create timestamped results directory name
-    results_name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    results_name = f"{args.dataset}_{args.model_architecture}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
     results_path = os.path.join('results', results_name)
     os.makedirs(results_path, exist_ok=True)
     print(f"Results will be saved to: {results_path}")
@@ -136,7 +203,18 @@ def main():
     jtvae_path = "./jtvae/"
     vocab_path = "data/zinc15/vocab.txt"
     model_path = "molvae/vae_model/model.iter-4"
-    blackbox_model_path = "black_box_model_training/models/delaney_BFGNNMolecularPredictor.pt"
+    blackbox_model_path = get_blackbox_model_path(args.dataset, args.model_architecture)
+    
+    # Check if black-box model exists
+    if not os.path.exists(blackbox_model_path):
+        print(f"Error: Black-box model not found at {blackbox_model_path}")
+        print(f"Available models for {args.dataset}:")
+        list_available_models(args.dataset)
+        print(f"\nPlease train the model first using:")
+        print(f"  cd black_box_model_training && python train.py --dataset {args.dataset}")
+        return
+    
+    print(f"Using black-box model: {blackbox_model_path}")
     
     # Initialize JT-VAE wrapper using mol-cycle-gan approach
     print("Initializing JT-VAE wrapper (mol-cycle-gan style)...")
@@ -150,34 +228,50 @@ def main():
     )
     
     print("Initializing black-box model...")
-    black_box_model = BlackBoxModel(model_path=blackbox_model_path, model_type='regression')
+    dataset_cfg = DATASETS[args.dataset]
+    black_box_model = BlackBoxModel(
+        model_path=blackbox_model_path, 
+        model_type=dataset_cfg['task_type']
+    )
     
     print("Initializing adversarial generator...")
     adversarial_model = AdversarialMolCycleGAN(
         jtvae_wrapper=jtvae,
         black_box_model=black_box_model,
+        learning_rate=args.learning_rate,
         results_name=results_name  # Pass the results directory name
     )
     
-    # Load training data from Delaney dataset with JT-VAE filtering
-    print("\n=== Loading Delaney Dataset with JT-VAE Filtering ===")
-    training_smiles, training_targets = load_molecules_from_delaney(
+    # Load training data from specified dataset with JT-VAE filtering
+    print(f"\n=== Loading {args.dataset.upper()} Training Dataset ===")
+    training_smiles, training_targets, train_cfg = load_molecules_from_dataset(
+        dataset_name=args.dataset,
         subset='train', 
-        # max_molecules=50,  # Limit to 50 molecules for training
-        jtvae_wrapper=jtvae  # Pass JT-VAE for filtering
+        max_molecules=args.max_train_molecules,
+        jtvae_wrapper=jtvae,  # Pass JT-VAE for filtering
+        force_refilter=args.force_refilter
     )
     
-    # Load test data from Delaney dataset with JT-VAE filtering
-    test_smiles, test_targets = load_molecules_from_delaney(
+    # Load test data from specified dataset with JT-VAE filtering
+    print(f"\n=== Loading {args.dataset.upper()} Test Dataset ===")
+    test_smiles, test_targets, test_cfg = load_molecules_from_dataset(
+        dataset_name=args.dataset,
         subset='test',
-        # max_molecules=20,
-        jtvae_wrapper=jtvae  # Pass JT-VAE for filtering
+        max_molecules=args.max_test_molecules,
+        jtvae_wrapper=jtvae,  # Pass JT-VAE for filtering
+        force_refilter=args.force_refilter
     )
     
     # Test encoding/decoding first
     print("\n=== Testing JT-VAE Encoding/Decoding ===")
-    test_molecule = training_smiles[0]  # Use first molecule from Delaney
+    test_molecule = training_smiles[0]  # Use first molecule from dataset
+    property_name = get_property_name(args.dataset)
+    target_value = training_targets[0][0] if len(training_targets) > 0 else "N/A"
     print(f"Test molecule: {test_molecule}")
+    if isinstance(target_value, (int, float)):
+        print(f"Target {property_name}: {target_value:.3f}")
+    else:
+        print(f"Target {property_name}: {target_value}")
     
     # Test encoding
     latent_array = jtvae.encode_to_numpy([test_molecule])
@@ -187,20 +281,29 @@ def main():
     decoded_smiles = jtvae.decode_from_numpy(latent_array)
     print(f"Decoded back to: {decoded_smiles[0] if decoded_smiles else 'Failed'}")
     
+    # Test the black-box model on the test molecule
+    print(f"\n=== Testing Black-box Model ({args.model_architecture}) ===")
+    test_prediction = black_box_model.predict(test_molecule)
+    print(f"Black-box model prediction: {test_prediction:.3f}")
+    
     # Train the adversarial generator
-    print("\n=== Training Adversarial Generator ===")
+    print(f"\n=== Training Adversarial Generator (targeting {args.model_architecture}) ===")
+    # The generator model will be automatically saved after training completes
+    # Checkpoints will also be saved every 50 epochs by default
     adversarial_model.train(
         training_smiles=training_smiles,
-        epochs=20,
-        batch_size=4,
-        lambda_adv=1.0,
-        lambda_sim=0.01,
-        success_threshold=0.7
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        lambda_adv=args.lambda_adv,
+        lambda_sim=args.lambda_sim,
+        success_threshold=args.success_threshold,
+        save_checkpoints=True,      # Save checkpoints during training
+        checkpoint_interval=args.checkpoint_interval
     )
     
     # Generate adversarial examples
     print("\n=== Generating Adversarial Examples ===")
-    test_molecules = test_smiles[:5]  # Use first 5 test molecules
+    test_molecules = test_smiles[:20]  # Use first 20 test molecules for better evaluation
     
     original_smiles = []
     adversarial_smiles = []
@@ -208,7 +311,10 @@ def main():
     
     for i, smiles in enumerate(test_molecules):
         target_value = test_targets[i][0] if len(test_targets) > i else "N/A"
-        print(f"Generating adversarial molecule for: {smiles} (solubility: {target_value:.3f})")
+        if isinstance(target_value, (int, float)):
+            print(f"Generating adversarial molecule for: {smiles} ({property_name}: {target_value:.3f})")
+        else:
+            print(f"Generating adversarial molecule for: {smiles} ({property_name}: {target_value})")
         adv_molecules = adversarial_model.generate_adversarial(smiles, num_samples=1)
         
         if adv_molecules:
@@ -219,71 +325,230 @@ def main():
         else:
             print(f"  -> Failed to generate adversarial molecule")
     
-    # Evaluate results
+    # Comprehensive evaluation using new evaluation.py
     if original_smiles and adversarial_smiles:
-        print("\n=== Evaluating Adversarial Attacks ===")
-        evaluation_results = evaluate_adversarial_attack(
-            original_smiles, 
-            adversarial_smiles, 
-            black_box_model
+        print(f"\n=== Comprehensive Adversarial Attack Evaluation on {args.model_architecture} ===")
+        
+        # Get all available models for transferability testing
+        models_dict = get_available_models_dict(args.dataset)
+        
+        # Remove the target model from transferability testing to avoid redundancy
+        if args.model_architecture in models_dict:
+            target_model = models_dict.pop(args.model_architecture)
+            print(f"Target model ({args.model_architecture}) removed from transferability testing")
+        
+        if models_dict:
+            print(f"Models for transferability testing: {list(models_dict.keys())}")
+        else:
+            print("No additional models available for transferability testing")
+            models_dict = None
+        
+        # Perform comprehensive evaluation
+        comprehensive_results = comprehensive_evaluation(
+            original_smiles=original_smiles,
+            adversarial_smiles=adversarial_smiles,
+            black_box_model=black_box_model,
+            training_smiles=training_smiles,  # For novelty calculation
+            models_dict=models_dict,  # Now includes all available models
+            success_threshold=args.success_threshold,
+            task_type=dataset_cfg['task_type'],
+            save_path=results_path,
+            dataset_name=args.dataset,
+            model_name=args.model_architecture
         )
         
-        # Add original targets to results dictionary
-        evaluation_results['original_target'] = []
-        for i in range(len(evaluation_results['original_smiles'])):
-            if i < len(original_targets):
-                evaluation_results['original_target'].append(original_targets[i])
-            else:
-                evaluation_results['original_target'].append(None)
+        # Extract individual results
+        attack_results = comprehensive_results['attack_results']
+        quality_results = comprehensive_results['quality_results']
+        transferability_results = comprehensive_results['transferability_results']
         
-        # Plot results
-        plot_evaluation_results(evaluation_results)
+        # Print summary statistics
+        print(f"\n=== Attack Success Metrics ===")
+        print(f"Success Rate: {attack_results['success_rate']:.3f}")
+        print(f"Successful Attacks: {attack_results['successful_attacks']}/{attack_results['total_attempts']}")
+        print(f"Average Prediction Change: {attack_results['avg_prediction_change']:.3f}")
+        print(f"Average Tanimoto Similarity: {attack_results['avg_tanimoto_similarity']:.3f}")
         
-        # Save results
-        results_df = pd.DataFrame(evaluation_results)
-        results_df.to_csv('results/adversarial_results_delaney.csv', index=False)
-        print("Results saved to results/adversarial_results_delaney.csv")
-    
-    # Example of single molecule attack
-    print("\n=== Single Molecule Attack Example ===")
-    target_smiles = training_smiles[0]  # Use first Delaney molecule
-    target_value = training_targets[0][0] if len(training_targets) > 0 else "N/A"
-    print(f"Target molecule: {target_smiles}")
-    print(f"Original Delaney solubility: {target_value:.3f}")
-    
-    original_pred = black_box_model.predict(target_smiles)
-    print(f"Black-box model prediction: {original_pred:.3f}")
-    
-    adv_molecules = adversarial_model.generate_adversarial(target_smiles, num_samples=3)
-    print(f"Generated {len(adv_molecules)} adversarial molecules:")
-    
-    if adv_molecules:
-        for i, adv_smiles in enumerate(adv_molecules):
-            adv_pred = black_box_model.predict(adv_smiles)
-            from evaluation import calculate_tanimoto_similarity
-            similarity = calculate_tanimoto_similarity(target_smiles, adv_smiles)
+        print(f"\n=== Molecular Quality Metrics ===")
+        print(f"Validity: {quality_results.get('validity_validity', 0):.3f}")
+        print(f"Uniqueness: {quality_results.get('uniqueness_uniqueness', 0):.3f}")
+        print(f"Novelty: {quality_results.get('novelty_novelty', 0):.3f}")
+        
+        # Print transferability results
+        if transferability_results:
+            print(f"\n=== Transferability Results ===")
+            for model_name, results in transferability_results.items():
+                success_rate = results.get('success_rate', 0)
+                avg_change = results.get('avg_prediction_change', 0)
+                successful = results.get('successful_attacks', 0)
+                total = results.get('total_attempts', 0)
+                print(f"{model_name}:")
+                print(f"  Success Rate: {success_rate:.3f} ({successful}/{total})")
+                print(f"  Avg Prediction Change: {avg_change:.3f}")
+        
+        # Create detailed results DataFrame
+        detailed_results = {
+            'original_smiles': attack_results['original_smiles'],
+            'adversarial_smiles': attack_results['adversarial_smiles'],
+            'original_predictions': attack_results['original_predictions'],
+            'adversarial_predictions': attack_results['adversarial_predictions'],
+            'tanimoto_similarities': attack_results['tanimoto_similarities'],
+            'prediction_changes': attack_results['prediction_changes'],
+            'original_targets': original_targets[:len(attack_results['original_smiles'])],
+            'model_architecture': [args.model_architecture] * len(attack_results['original_smiles']),
+            'dataset': [args.dataset] * len(attack_results['original_smiles'])
+        }
+        
+        # Add transferability results to detailed DataFrame (with proper length checking)
+        if transferability_results:
+            main_length = len(attack_results['original_smiles'])
+            for model_name, results in transferability_results.items():
+                # Get predictions and changes, padding with None if needed
+                model_adv_preds = results.get('adversarial_predictions', [])
+                model_pred_changes = results.get('prediction_changes', [])
+                model_orig_preds = results.get('original_predictions', [])
+                
+                # Ensure arrays are the same length as main results
+                if len(model_adv_preds) >= main_length:
+                    detailed_results[f'{model_name}_adv_predictions'] = model_adv_preds[:main_length]
+                else:
+                    detailed_results[f'{model_name}_adv_predictions'] = model_adv_preds + [None] * (main_length - len(model_adv_preds))
+                
+                if len(model_orig_preds) >= main_length:
+                    detailed_results[f'{model_name}_orig_predictions'] = model_orig_preds[:main_length]
+                else:
+                    detailed_results[f'{model_name}_orig_predictions'] = model_orig_preds + [None] * (main_length - len(model_orig_preds))
+                
+                if len(model_pred_changes) >= main_length:
+                    detailed_results[f'{model_name}_pred_changes'] = model_pred_changes[:main_length]
+                else:
+                    detailed_results[f'{model_name}_pred_changes'] = model_pred_changes + [None] * (main_length - len(model_pred_changes))
+                
+                # Calculate success for each example
+                success_flags = []
+                for i in range(main_length):
+                    if i < len(model_pred_changes):
+                        success_flags.append(1 if model_pred_changes[i] >= args.success_threshold else 0)
+                    else:
+                        success_flags.append(None)
+                
+                detailed_results[f'{model_name}_attack_success'] = success_flags
+        
+        # Save detailed results
+        results_df = pd.DataFrame(detailed_results)
+        results_file = os.path.join(results_path, f'adversarial_results_{args.dataset}_{args.model_architecture}.csv')
+        results_df.to_csv(results_file, index=False)
+        print(f"Detailed results saved to {results_file}")
+        
+        # Save comprehensive metrics summary
+        metrics_summary = {
+            'dataset': args.dataset,
+            'model_architecture': args.model_architecture,
+            'attack_success_rate': attack_results['success_rate'],
+            'avg_prediction_change': attack_results['avg_prediction_change'],
+            'avg_tanimoto_similarity': attack_results['avg_tanimoto_similarity'],
+            'min_tanimoto_similarity': attack_results['min_tanimoto_similarity'],
+            'max_tanimoto_similarity': attack_results['max_tanimoto_similarity'],
+            'validity': quality_results.get('validity_validity', 0),
+            'uniqueness': quality_results.get('uniqueness_uniqueness', 0),
+            'novelty': quality_results.get('novelty_novelty', 0),
+            'successful_attacks': attack_results['successful_attacks'],
+            'total_attempts': attack_results['total_attempts'],
+            'valid_molecules': quality_results.get('validity_valid_molecules', 0),
+            'unique_molecules': quality_results.get('uniqueness_unique_molecules', 0),
+            'novel_molecules': quality_results.get('novelty_novel_molecules', 0),
+            'models_tested_for_transferability': len(transferability_results) if transferability_results else 0
+        }
+        
+        # Add transferability metrics to summary
+        if transferability_results:
+            for model_name, results in transferability_results.items():
+                metrics_summary[f'{model_name}_transferability_success_rate'] = results.get('success_rate', 0)
+                metrics_summary[f'{model_name}_transferability_avg_change'] = results.get('avg_prediction_change', 0)
+        
+        metrics_df = pd.DataFrame([metrics_summary])
+        metrics_file = os.path.join(results_path, f'evaluation_metrics_{args.dataset}_{args.model_architecture}.csv')
+        metrics_df.to_csv(metrics_file, index=False)
+        print(f"Evaluation metrics saved to {metrics_file}")
+        
+        # Print individual adversarial examples with detailed analysis
+        print(f"\n=== Individual Adversarial Examples Analysis ===")
+        for i in range(min(5, len(attack_results['original_smiles']))):  # Show first 5 examples
+            orig_smiles = attack_results['original_smiles'][i]
+            adv_smiles = attack_results['adversarial_smiles'][i]
+            orig_pred = attack_results['original_predictions'][i]
+            adv_pred = attack_results['adversarial_predictions'][i]
+            similarity = attack_results['tanimoto_similarities'][i]
+            pred_change = attack_results['prediction_changes'][i]
             
-            print(f"Adversarial molecule {i+1}: {adv_smiles}")
-            print(f"  Predicted solubility: {adv_pred:.3f}")
+            print(f"\nExample {i+1}:")
+            print(f"  Original:     {orig_smiles}")
+            print(f"  Adversarial:  {adv_smiles}")
+            print(f"  Original {property_name}: {orig_pred:.3f}")
+            print(f"  Adversarial {property_name}: {adv_pred:.3f}")
+            print(f"  Prediction change: {pred_change:.3f}")
             print(f"  Tanimoto similarity: {similarity:.3f}")
-            print(f"  Solubility difference: {abs(original_pred - adv_pred):.3f}")
+            
+            # Show transferability for this example
+            if transferability_results:
+                print(f"  Transferability:")
+                for model_name, results in transferability_results.items():
+                    if i < len(results.get('adversarial_predictions', [])):
+                        transfer_pred = results['adversarial_predictions'][i]
+                        transfer_change = results['prediction_changes'][i]
+                        transfer_success = "✓" if transfer_change >= args.success_threshold else "✗"
+                        print(f"    {model_name}: {transfer_pred:.3f} (Δ{transfer_change:.3f}) {transfer_success}")
+            
+            # Determine if attack was successful
+            if pred_change >= args.success_threshold:
+                print(f"  Status: ✓ SUCCESSFUL ATTACK")
+            else:
+                print(f"  Status: ✗ Failed attack") 
     
-    # Save dataset statistics
+    else:
+        print("No adversarial molecules generated for evaluation.")
+    
+    # Save comprehensive dataset statistics
     print("\n=== Dataset Statistics ===")
     stats = {
-        'dataset': 'Delaney',
+        'dataset': args.dataset,
+        'model_architecture': args.model_architecture,
+        'task_type': dataset_cfg['task_type'],
+        'metric': dataset_cfg['metric_name'],
         'total_training_molecules': len(training_smiles),
         'total_test_molecules': len(test_smiles),
+        'molecules_attempted': len(test_molecules),
         'successful_adversarial_generations': len(adversarial_smiles),
+        'generation_success_rate': len(adversarial_smiles) / len(test_molecules) if test_molecules else 0,
         'average_original_prediction': np.mean([black_box_model.predict(s) for s in original_smiles]) if original_smiles else 0,
         'average_adversarial_prediction': np.mean([black_box_model.predict(s) for s in adversarial_smiles]) if adversarial_smiles else 0,
+        'cached_datasets_used': not args.force_refilter,
+        'blackbox_model_path': blackbox_model_path,
+        'success_threshold': args.success_threshold,
+        'epochs_trained': args.epochs,
+        'batch_size': args.batch_size,
+        'learning_rate': args.learning_rate,
+        'lambda_adv': args.lambda_adv,
+        'lambda_sim': args.lambda_sim
     }
     
-    stats_df = pd.DataFrame([stats])
-    stats_df.to_csv(os.path.join(results_path, 'dataset_statistics.csv'), index=False)
-    print(f"Dataset statistics saved to {os.path.join(results_path, 'dataset_statistics.csv')}")
+    # Add evaluation metrics to stats if available
+    if original_smiles and adversarial_smiles:
+        stats.update({
+            'attack_success_rate': attack_results['success_rate'],
+            'avg_prediction_change': attack_results['avg_prediction_change'],
+            'avg_tanimoto_similarity': attack_results['avg_tanimoto_similarity'],
+            'validity': quality_results.get('validity_validity', 0),
+            'uniqueness': quality_results.get('uniqueness_uniqueness', 0),
+            'novelty': quality_results.get('novelty_novelty', 0)
+        })
     
-    print("=== Attack Complete ===")
+    stats_df = pd.DataFrame([stats])
+    stats_file = os.path.join(results_path, 'comprehensive_statistics.csv')
+    stats_df.to_csv(stats_file, index=False)
+    print(f"Comprehensive statistics saved to {stats_file}")
+    
+    print("=== Adversarial Attack Evaluation Complete ===")
 
 if __name__ == "__main__":
     main()

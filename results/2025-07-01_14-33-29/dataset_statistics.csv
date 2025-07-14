@@ -1,0 +1,2 @@
+dataset,total_training_molecules,total_test_molecules,successful_adversarial_generations,average_original_prediction,average_adversarial_prediction
+Delaney,50,20,5,-0.09094697833061219,0.26348116993904114
