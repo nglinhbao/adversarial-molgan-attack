@@ -20,10 +20,6 @@ wheels/
 .installed.cfg
 *.egg
 
-# PyTorch
-*.pth
-*.pt
-
 # Jupyter Notebook
 .ipynb_checkpoints
 
