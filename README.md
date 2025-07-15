@@ -93,6 +93,3 @@ python main.py --list_models --dataset delaney
 # Clean cached data
 python main.py --clean_datasets all
 ```
-```
-
-This version is much more concise while still covering the essential information users need to get started and understand what the repository does.This version is much more concise while still covering the essential information users need to get started and understand what the repository does.
